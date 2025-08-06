@@ -62,6 +62,7 @@ int main(int argc, char* argv[]) {
 
     int ch;
     while (1) {
+        get_terminal_size();
         // Draw UI
         clear_screen();
         printf("\033[107;30m%*sEditing %s%*s\033[0m\n",
