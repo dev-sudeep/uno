@@ -6,8 +6,10 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <ctype.h>
 
-#define MAX_BUFFER 8192
+#define MAX_BUFFER 16384
+#define MAX_LINE_LEN 1024
 
 volatile sig_atomic_t window_resized = 0;
 struct termios orig_term;
@@ -48,26 +50,42 @@ void move_cursor(int x, int y) {
     printf("\033[%d;%dH", y, x);
 }
 
-int line_offset[MAX_BUFFER]; // stores start index of each line in buffer
-
-void recalculate_lines(char* buffer, size_t len, int* total_lines) {
-    *total_lines = 0;
-    line_offset[0] = 0;
-    for (size_t i = 0; i < len; i++) {
-        if (buffer[i] == '\n') {
-            (*total_lines)++;
-            line_offset[*total_lines] = i + 1;
-        }
+int is_keyword(const char* word) {
+    const char* keywords[] = {
+        "int", "return", "if", "else", "while", "for", "void", "char",
+        "float", "double", "struct", "break", "continue", "switch", "case",
+        "#include", "#define", "const", "static", "sizeof", NULL
+    };
+    for (int i = 0; keywords[i]; i++) {
+        if (strcmp(word, keywords[i]) == 0) return 1;
     }
-    (*total_lines)++;
+    return 0;
 }
 
-int get_line_from_cursor(size_t cursor, int total_lines) {
-    for (int i = 0; i < total_lines; i++) {
-        if (cursor < line_offset[i + 1] || i + 1 == total_lines)
-            return i;
+void print_with_syntax(const char* line, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        if (isalpha(line[i]) || line[i] == '#' || line[i] == '_') {
+            char word[64] = {0};
+            size_t j = 0;
+            while ((isalnum(line[i]) || line[i] == '_' || line[i] == '#') && j < sizeof(word) - 1)
+                word[j++] = line[i++];
+            word[j] = '\0';
+            if (is_keyword(word))
+                printf("\033[1;34m%s\033[0m", word);  // Blue keywords
+            else
+                printf("%s", word);
+        } else if (line[i] == '"' || line[i] == '\'') {
+            char quote = line[i++];
+            printf("\033[0;32m%c", quote);  // Green strings
+            while (i < len && line[i] != quote) {
+                putchar(line[i++]);
+            }
+            if (i < len) printf("%c\033[0m", line[i++]);
+        } else {
+            putchar(line[i++]);
+        }
     }
-    return total_lines - 1;
 }
 
 int main(int argc, char* argv[]) {
@@ -90,10 +108,7 @@ int main(int argc, char* argv[]) {
     char buffer[MAX_BUFFER] = {0};
     size_t len = fread(buffer, 1, MAX_BUFFER - 1, file);
     size_t cursor = len;
-    int total_lines = 0;
-    int column = 0;
-
-    recalculate_lines(buffer, len, &total_lines);
+    int logical_x = 0, logical_y = 0;
 
     int ch;
     while (1) {
@@ -104,20 +119,39 @@ int main(int argc, char* argv[]) {
 
         clear_screen();
         printf("\033[107;30m%*sEditing %s%*s\033[0m\n",
-               (width - (int)(strlen(argv[1]) + 8)) / 2, "",
-               argv[1],
-               (width - (int)(strlen(argv[1]) + 8)) / 2, "");
+            (width - (int)(strlen(argv[1]) + 8)) / 2, "",
+            argv[1],
+            (width - (int)(strlen(argv[1]) + 8)) / 2, "");
 
-        // Print buffer content
-        for (size_t i = 0; i < len; i++) {
-            putchar(buffer[i]);
+        size_t line_start = 0;
+        int row = 2, col = 1;
+        for (size_t i = 0; i < len;) {
+            size_t line_len = 0;
+            while (i + line_len < len && buffer[i + line_len] != '\n') line_len++;
+            move_cursor(1, row++);
+            print_with_syntax(&buffer[i], line_len);
+            i += line_len;
+            if (i < len && buffer[i] == '\n') {
+                i++;
+                putchar('\n');
+            }
         }
 
-        // Determine cursor position
-        int line = get_line_from_cursor(cursor, total_lines);
-        int col = cursor - line_offset[line];
-        move_cursor(col + 1, line + 2);  // +2 to skip title
-
+        // Calculate cursor position
+        size_t cx = 0, cy = 2;
+        for (size_t i = 0; i < cursor; i++) {
+            if (buffer[i] == '\n') {
+                cy++;
+                cx = 0;
+            } else {
+                cx++;
+                if (cx >= (size_t)width) {
+                    cx = 0;
+                    cy++;
+                }
+            }
+        }
+        move_cursor(cx + 1, cy);
         fflush(stdout);
 
         ch = getchar();
@@ -129,41 +163,47 @@ int main(int argc, char* argv[]) {
                 cursor--;
                 len--;
             }
+        } else if (ch == 10) { // Enter
+            if (len < MAX_BUFFER - 1) {
+                memmove(&buffer[cursor + 1], &buffer[cursor], len - cursor);
+                buffer[cursor++] = '\n';
+                len++;
+            }
         } else if (ch == 27) { // Arrow keys
             int seq1 = getchar();
             int seq2 = getchar();
             if (seq1 == '[') {
-                int line = get_line_from_cursor(cursor, total_lines);
-                int col = cursor - line_offset[line];
-
-                if (seq2 == 'D' && cursor > 0) cursor--;               // Left
-                else if (seq2 == 'C' && cursor < len) cursor++;        // Right
-                else if (seq2 == 'A' && line > 0) {                    // Up
-                    int prev_len = line_offset[line] - line_offset[line - 1];
-                    int target = line_offset[line - 1] + col;
-                    if (target >= line_offset[line]) target = line_offset[line] - 1;
-                    cursor = target;
-                } else if (seq2 == 'B' && line < total_lines - 1) {   // Down
-                    int next_len = line_offset[line + 1] - line_offset[line];
-                    int target = line_offset[line + 1] + col;
-                    if (line + 2 < total_lines && target >= line_offset[line + 2])
-                        target = line_offset[line + 2] - 1;
-                    else if (target > len) target = len;
-                    cursor = target;
+                if (seq2 == 'C' && cursor < len) cursor++;       // Right
+                else if (seq2 == 'D' && cursor > 0) cursor--;    // Left
+                else if (seq2 == 'A') { // Up
+                    size_t temp = cursor;
+                    while (temp > 0 && buffer[temp - 1] != '\n') temp--;
+                    if (temp > 0) {
+                        size_t prev_line_start = temp - 1;
+                        while (prev_line_start > 0 && buffer[prev_line_start - 1] != '\n') prev_line_start--;
+                        size_t offset = cursor - temp;
+                        cursor = prev_line_start;
+                        while (cursor < temp - 1 && offset--) cursor++;
+                    }
+                } else if (seq2 == 'B') { // Down
+                    size_t temp = cursor;
+                    while (temp < len && buffer[temp] != '\n') temp++;
+                    if (temp < len) {
+                        size_t next_line_start = temp + 1;
+                        size_t offset = cursor - (cursor > 0 && buffer[cursor - 1] == '\n' ? cursor - 1 : cursor);
+                        cursor = next_line_start;
+                        while (cursor < len && buffer[cursor] != '\n' && offset--) cursor++;
+                    }
                 }
             }
-        } else if ((ch >= 32 && ch <= 126) || ch == 10) { // Printable or newline
+        } else if (ch >= 32 && ch <= 126) { // Printable characters
             if (len < MAX_BUFFER - 1) {
                 memmove(&buffer[cursor + 1], &buffer[cursor], len - cursor);
-                buffer[cursor] = ch;
-                cursor++;
+                buffer[cursor++] = ch;
                 len++;
             }
         }
 
-        recalculate_lines(buffer, len, &total_lines);
-
-        // Write changes
         rewind(file);
         fwrite(buffer, 1, len, file);
         fflush(file);
