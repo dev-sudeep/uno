@@ -5,26 +5,32 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #define MAX_BUFFER 8192
 
+volatile sig_atomic_t window_resized = 0;
 struct termios orig_term;
 int width = 80, height = 24;
 
-void disable_raw_mode() {
+void handle_winch(int sig) {
+    window_resized = 1;
+}
+
+void disable_raw_mode(void) {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
 }
 
-void enable_raw_mode() {
+void enable_raw_mode(void) {
     tcgetattr(STDIN_FILENO, &orig_term);
     atexit(disable_raw_mode);
 
     struct termios raw = orig_term;
-    raw.c_lflag &= ~(ECHO | ICANON); // Disable echo and canonical mode
+    raw.c_lflag &= ~(ECHO | ICANON); // raw mode
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
-void get_terminal_size() {
+void get_terminal_size(void) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
         width = ws.ws_col;
@@ -32,12 +38,50 @@ void get_terminal_size() {
     }
 }
 
-void clear_screen() {
+void clear_screen(void) {
     printf("\033[2J\033[H");
 }
 
 void move_cursor(int x, int y) {
     printf("\033[%d;%dH", y, x);
+}
+
+void draw_buffer(const char *buffer, size_t len, const char *filename, size_t cursor) {
+    clear_screen();
+    printf("\033[107;30m%*sEditing %s%*s\033[0m\n",
+           (width - (int)(strlen(filename) + 8)) / 2, "",
+           filename,
+           (width - (int)(strlen(filename) + 8)) / 2, "");
+
+    size_t visual_row = 2, visual_col = 1;
+    size_t i;
+    for (i = 0; i < len; ++i) {
+        if (i == cursor) {
+            // Save position where cursor should be
+            move_cursor(visual_col, visual_row);
+        }
+
+        char c = buffer[i];
+        if (c == '\n') {
+            putchar('\n');
+            visual_row++;
+            visual_col = 1;
+        } else {
+            putchar(c);
+            visual_col++;
+            if (visual_col > width) {
+                visual_col = 1;
+                visual_row++;
+            }
+        }
+    }
+
+    if (cursor == len) {
+        // If cursor is at end
+        move_cursor(visual_col, visual_row);
+    }
+
+    fflush(stdout);
 }
 
 int main(int argc, char* argv[]) {
@@ -60,30 +104,16 @@ int main(int argc, char* argv[]) {
     size_t len = fread(buffer, 1, MAX_BUFFER - 1, file);
     size_t cursor = len;
 
+    signal(SIGWINCH, handle_winch);
+
     int ch;
     while (1) {
-        get_terminal_size();
-        // Draw UI
-        clear_screen();
-        printf("\033[107;30m%*sEditing %s%*s\033[0m\n",
-               (width - (int)(strlen(argv[1]) + 8)) / 2, "",
-               argv[1],
-               (width - (int)(strlen(argv[1]) + 8)) / 2, "");
-        
-        // Print text with line wrapping
-        int lines = 1;
-        for (size_t i = 0; i < len; i++) {
-            putchar(buffer[i]);
-            if ((i + 1) % width == 0) lines++;
+        if (window_resized) {
+            get_terminal_size();
+            window_resized = 0;
         }
-        if (len % width == 0) lines++; // avoid cursor on next line invisibly
-        
-        // Position cursor after printed text
-        int cursor_row = 2 + (int)(cursor / width);
-        int cursor_col = 1 + (int)(cursor % width);
-        move_cursor(cursor_col, cursor_row);
-        
-        fflush(stdout);
+
+        draw_buffer(buffer, len, argv[1], cursor);
 
         ch = getchar();
         if (ch == 17) break; // Ctrl+Q
@@ -94,14 +124,14 @@ int main(int argc, char* argv[]) {
                 cursor--;
                 len--;
             }
-        } else if (ch == 27) { // Escape sequence (arrow keys)
+        } else if (ch == 27) { // Arrow keys
             int seq1 = getchar();
             int seq2 = getchar();
             if (seq1 == '[') {
                 if (seq2 == 'C' && cursor < len) cursor++;     // Right
                 else if (seq2 == 'D' && cursor > 0) cursor--;  // Left
             }
-        } else if (ch >= 32 && ch <= 126) { // Printable characters
+        } else if ((ch >= 32 && ch <= 126) || ch == 10) { // Printable or newline
             if (len < MAX_BUFFER - 1) {
                 memmove(&buffer[cursor + 1], &buffer[cursor], len - cursor);
                 buffer[cursor] = ch;
@@ -121,4 +151,3 @@ int main(int argc, char* argv[]) {
     clear_screen();
     return 0;
 }
-
