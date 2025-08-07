@@ -26,7 +26,7 @@ void enable_raw_mode(void) {
     atexit(disable_raw_mode);
 
     struct termios raw = orig_term;
-    raw.c_lflag &= ~(ECHO | ICANON); // raw mode
+    raw.c_lflag &= ~(ECHO | ICANON); // Disable echo and canonical mode
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
@@ -46,19 +46,22 @@ void move_cursor(int x, int y) {
     printf("\033[%d;%dH", y, x);
 }
 
-void draw_buffer(const char *buffer, size_t len, const char *filename, size_t cursor) {
+// Draws buffer and computes screen position of the cursor
+void draw_buffer(const char *buffer, size_t len, const char *filename, size_t cursor_index) {
     clear_screen();
     printf("\033[107;30m%*sEditing %s%*s\033[0m\n",
            (width - (int)(strlen(filename) + 8)) / 2, "",
            filename,
            (width - (int)(strlen(filename) + 8)) / 2, "");
 
-    size_t visual_row = 2, visual_col = 1;
-    size_t i;
-    for (i = 0; i < len; ++i) {
-        if (i == cursor) {
-            // Save position where cursor should be
-            move_cursor(visual_col, visual_row);
+    size_t visual_row = 2;
+    size_t visual_col = 1;
+    size_t cursor_row = 2, cursor_col = 1;
+
+    for (size_t i = 0; i < len; ++i) {
+        if (i == cursor_index) {
+            cursor_row = visual_row;
+            cursor_col = visual_col;
         }
 
         char c = buffer[i];
@@ -76,11 +79,12 @@ void draw_buffer(const char *buffer, size_t len, const char *filename, size_t cu
         }
     }
 
-    if (cursor == len) {
-        // If cursor is at end
-        move_cursor(visual_col, visual_row);
+    if (cursor_index == len) {
+        cursor_row = visual_row;
+        cursor_col = visual_col;
     }
 
+    move_cursor(cursor_col, cursor_row);
     fflush(stdout);
 }
 
@@ -118,7 +122,7 @@ int main(int argc, char* argv[]) {
         ch = getchar();
         if (ch == 17) break; // Ctrl+Q
 
-        if (ch == 127) { // Backspace
+        if (ch == 127 || ch == 8) { // Backspace
             if (cursor > 0) {
                 memmove(&buffer[cursor - 1], &buffer[cursor], len - cursor);
                 cursor--;
@@ -128,8 +132,11 @@ int main(int argc, char* argv[]) {
             int seq1 = getchar();
             int seq2 = getchar();
             if (seq1 == '[') {
-                if (seq2 == 'C' && cursor < len) cursor++;     // Right
-                else if (seq2 == 'D' && cursor > 0) cursor--;  // Left
+                if (seq2 == 'C' && cursor < len) {
+                    cursor++; // Right
+                } else if (seq2 == 'D' && cursor > 0) {
+                    cursor--; // Left
+                }
             }
         } else if ((ch >= 32 && ch <= 126) || ch == 10) { // Printable or newline
             if (len < MAX_BUFFER - 1) {
@@ -151,3 +158,4 @@ int main(int argc, char* argv[]) {
     clear_screen();
     return 0;
 }
+
