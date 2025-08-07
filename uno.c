@@ -26,7 +26,9 @@ void enable_raw_mode(void) {
     atexit(disable_raw_mode);
 
     struct termios raw = orig_term;
-    raw.c_lflag &= ~(ECHO | ICANON); // Disable echo and canonical mode
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
@@ -46,46 +48,26 @@ void move_cursor(int x, int y) {
     printf("\033[%d;%dH", y, x);
 }
 
-// Draws buffer and computes screen position of the cursor
-void draw_buffer(const char *buffer, size_t len, const char *filename, size_t cursor_index) {
-    clear_screen();
-    printf("\033[107;30m%*sEditing %s%*s\033[0m\n",
-           (width - (int)(strlen(filename) + 8)) / 2, "",
-           filename,
-           (width - (int)(strlen(filename) + 8)) / 2, "");
+int line_offset[MAX_BUFFER]; // stores start index of each line in buffer
 
-    size_t visual_row = 2;
-    size_t visual_col = 1;
-    size_t cursor_row = 2, cursor_col = 1;
-
-    for (size_t i = 0; i < len; ++i) {
-        if (i == cursor_index) {
-            cursor_row = visual_row;
-            cursor_col = visual_col;
-        }
-
-        char c = buffer[i];
-        if (c == '\n') {
-            putchar('\n');
-            visual_row++;
-            visual_col = 1;
-        } else {
-            putchar(c);
-            visual_col++;
-            if (visual_col > width) {
-                visual_col = 1;
-                visual_row++;
-            }
+void recalculate_lines(char* buffer, size_t len, int* total_lines) {
+    *total_lines = 0;
+    line_offset[0] = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (buffer[i] == '\n') {
+            (*total_lines)++;
+            line_offset[*total_lines] = i + 1;
         }
     }
+    (*total_lines)++;
+}
 
-    if (cursor_index == len) {
-        cursor_row = visual_row;
-        cursor_col = visual_col;
+int get_line_from_cursor(size_t cursor, int total_lines) {
+    for (int i = 0; i < total_lines; i++) {
+        if (cursor < line_offset[i + 1] || i + 1 == total_lines)
+            return i;
     }
-
-    move_cursor(cursor_col, cursor_row);
-    fflush(stdout);
+    return total_lines - 1;
 }
 
 int main(int argc, char* argv[]) {
@@ -96,6 +78,7 @@ int main(int argc, char* argv[]) {
 
     enable_raw_mode();
     get_terminal_size();
+    signal(SIGWINCH, handle_winch);
 
     FILE* file = fopen(argv[1], "r+");
     if (!file) file = fopen(argv[1], "w+");
@@ -107,8 +90,10 @@ int main(int argc, char* argv[]) {
     char buffer[MAX_BUFFER] = {0};
     size_t len = fread(buffer, 1, MAX_BUFFER - 1, file);
     size_t cursor = len;
+    int total_lines = 0;
+    int column = 0;
 
-    signal(SIGWINCH, handle_winch);
+    recalculate_lines(buffer, len, &total_lines);
 
     int ch;
     while (1) {
@@ -117,12 +102,28 @@ int main(int argc, char* argv[]) {
             window_resized = 0;
         }
 
-        draw_buffer(buffer, len, argv[1], cursor);
+        clear_screen();
+        printf("\033[107;30m%*sEditing %s%*s\033[0m\n",
+               (width - (int)(strlen(argv[1]) + 8)) / 2, "",
+               argv[1],
+               (width - (int)(strlen(argv[1]) + 8)) / 2, "");
+
+        // Print buffer content
+        for (size_t i = 0; i < len; i++) {
+            putchar(buffer[i]);
+        }
+
+        // Determine cursor position
+        int line = get_line_from_cursor(cursor, total_lines);
+        int col = cursor - line_offset[line];
+        move_cursor(col + 1, line + 2);  // +2 to skip title
+
+        fflush(stdout);
 
         ch = getchar();
         if (ch == 17) break; // Ctrl+Q
 
-        if (ch == 127 || ch == 8) { // Backspace
+        if (ch == 127) { // Backspace
             if (cursor > 0) {
                 memmove(&buffer[cursor - 1], &buffer[cursor], len - cursor);
                 cursor--;
@@ -132,10 +133,23 @@ int main(int argc, char* argv[]) {
             int seq1 = getchar();
             int seq2 = getchar();
             if (seq1 == '[') {
-                if (seq2 == 'C' && cursor < len) {
-                    cursor++; // Right
-                } else if (seq2 == 'D' && cursor > 0) {
-                    cursor--; // Left
+                int line = get_line_from_cursor(cursor, total_lines);
+                int col = cursor - line_offset[line];
+
+                if (seq2 == 'D' && cursor > 0) cursor--;               // Left
+                else if (seq2 == 'C' && cursor < len) cursor++;        // Right
+                else if (seq2 == 'A' && line > 0) {                    // Up
+                    int prev_len = line_offset[line] - line_offset[line - 1];
+                    int target = line_offset[line - 1] + col;
+                    if (target >= line_offset[line]) target = line_offset[line] - 1;
+                    cursor = target;
+                } else if (seq2 == 'B' && line < total_lines - 1) {   // Down
+                    int next_len = line_offset[line + 1] - line_offset[line];
+                    int target = line_offset[line + 1] + col;
+                    if (line + 2 < total_lines && target >= line_offset[line + 2])
+                        target = line_offset[line + 2] - 1;
+                    else if (target > len) target = len;
+                    cursor = target;
                 }
             }
         } else if ((ch >= 32 && ch <= 126) || ch == 10) { // Printable or newline
@@ -147,7 +161,9 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Write buffer to file
+        recalculate_lines(buffer, len, &total_lines);
+
+        // Write changes
         rewind(file);
         fwrite(buffer, 1, len, file);
         fflush(file);
