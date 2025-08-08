@@ -50,6 +50,45 @@ void move_cursor(int x, int y) {
     printf("\033[%d;%dH", y, x);
 }
 
+typedef enum {
+    FILE_TYPE_TEXT,
+    FILE_TYPE_C,
+    FILE_TYPE_PYTHON,
+    FILE_TYPE_BASH,
+    FILE_TYPE_UNKNOWN
+} FileType;
+
+FileType detect_file_type(const char* filename) {
+    const char* ext = strrchr(filename, '.');
+    if (!ext) return FILE_TYPE_TEXT;
+    
+    ext++; // Skip the dot
+    if (strcasecmp(ext, "c") == 0 || strcasecmp(ext, "h") == 0 ||
+        strcasecmp(ext, "cpp") == 0 || strcasecmp(ext, "hpp") == 0)
+        return FILE_TYPE_C;
+    else if (strcasecmp(ext, "py") == 0)
+        return FILE_TYPE_PYTHON;
+    else if (strcasecmp(ext, "sh") == 0 || strcasecmp(ext, "bash") == 0)
+        return FILE_TYPE_BASH;
+    
+    // Check if file is binary
+    FILE* fp = fopen(filename, "rb");
+    if (fp) {
+        unsigned char buf[1024];
+        size_t n = fread(buf, 1, sizeof(buf), fp);
+        fclose(fp);
+        for (size_t i = 0; i < n; i++) {
+            if (buf[i] == 0) return FILE_TYPE_UNKNOWN;
+        }
+    }
+    
+    return FILE_TYPE_TEXT;
+}
+
+void print_plain_text(const char* line, size_t len) {
+    printf("%.*s", (int)len, line);
+}
+
 int is_keyword(const char* word) {
     const char* keywords[] = {
         "int", "return", "if", "else", "while", "for", "void", "char",
@@ -62,25 +101,40 @@ int is_keyword(const char* word) {
     return 0;
 }
 
-void print_with_syntax(const char* line, size_t len) {
+void print_with_syntax(const char* line, size_t len, FileType type) {
+    if (type == FILE_TYPE_TEXT || type == FILE_TYPE_UNKNOWN) {
+        print_plain_text(line, len);
+        return;
+    }
+    
     size_t i = 0;
     while (i < len) {
         if (isalpha(line[i]) || line[i] == '#' || line[i] == '_') {
+            // Find word boundary
+            size_t word_end = i;
+            while (word_end < len && (isalnum(line[word_end]) || line[word_end] == '_' || line[word_end] == '#'))
+                word_end++;
+            
+            // Extract and print complete word
             char word[64] = {0};
-            size_t j = 0;
-            while ((isalnum(line[i]) || line[i] == '_' || line[i] == '#') && j < sizeof(word) - 1)
-                word[j++] = line[i++];
-            word[j] = '\0';
-            if (is_keyword(word))
-                printf("\033[1;34m%s\033[0m", word);  // Blue keywords
-            else
-                printf("%s", word);
+            size_t word_len = word_end - i;
+            if (word_len < sizeof(word) - 1) {
+                strncpy(word, &line[i], word_len);
+                word[word_len] = '\0';
+                if (is_keyword(word))
+                    printf("\033[1;34m%s\033[0m", word);
+                else
+                    printf("%s", word);
+            }
+            i = word_end;
         } else if (line[i] == '"' || line[i] == '\'') {
             char quote = line[i++];
-            printf("\033[0;32m%c", quote);  // Green strings
+            printf("\033[0;32m%c", quote);
+            size_t str_start = i;
             while (i < len && line[i] != quote) {
-                putchar(line[i++]);
+                i++;
             }
+            printf("%.*s", (int)(i - str_start), &line[str_start]);
             if (i < len) printf("%c\033[0m", line[i++]);
         } else {
             putchar(line[i++]);
@@ -110,6 +164,8 @@ int main(int argc, char* argv[]) {
     size_t cursor = len;
     int logical_x = 0, logical_y = 0;
 
+    FileType file_type = detect_file_type(argv[1]);
+
     int ch;
     while (1) {
         if (window_resized) {
@@ -129,7 +185,7 @@ int main(int argc, char* argv[]) {
             size_t line_len = 0;
             while (i + line_len < len && buffer[i + line_len] != '\n') line_len++;
             move_cursor(1, row++);
-            print_with_syntax(&buffer[i], line_len);
+            print_with_syntax(&buffer[i], line_len, file_type);
             i += line_len;
             if (i < len && buffer[i] == '\n') {
                 i++;
@@ -198,12 +254,15 @@ int main(int argc, char* argv[]) {
             }
         } else if (ch >= 32 && ch <= 126) { // Printable characters
             if (len < MAX_BUFFER - 1) {
+                if (cursor > len) cursor = len;  // Safety check
                 memmove(&buffer[cursor + 1], &buffer[cursor], len - cursor);
                 buffer[cursor++] = ch;
                 len++;
+                buffer[len] = '\0';  // Ensure null termination
             }
         }
 
+        if (cursor > len) cursor = len;  // Maintain cursor bounds
         rewind(file);
         fwrite(buffer, 1, len, file);
         fflush(file);
