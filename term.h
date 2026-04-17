@@ -5,6 +5,10 @@
  *   - Terminal dimensions (width / height)
  *   - Raw mode enable / disable
  *   - True-colour (RGB) text and background colouring
+ *   - Screen clear / cursor home shortcuts
+ *   - Cursor movement and position query
+ *   - Non-blocking key detection
+ *   - Full background fill
  *
  * All functions are static inline — simply #include "term.h" in every
  * translation unit that needs it; no separate compilation step is required.
@@ -25,6 +29,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -36,6 +41,33 @@ static int            _term_raw_active = 0;
 static struct termios _term_saved_attrs;
 
 /* =========================================================================
+ * Screen control macros
+ * ======================================================================= */
+
+#define TERM_CLEAR_SCREEN  "\033[2J\033[H"  /* clear entire screen + cursor to (0,0) */
+#define TERM_CURSOR_HOME   "\033[H"         /* cursor to (0,0) without clearing       */
+#define TERM_HIDE_CURSOR   "\033[?25l"      /* hide cursor                            */
+#define TERM_SHOW_CURSOR   "\033[?25h"      /* show cursor                            */
+
+/**
+ * term_clear - Clear the entire screen and move cursor to (0,0).
+ * @return  0 on success, -1 on failure.
+ */
+static inline int term_clear(void)
+{
+    return (fputs(TERM_CLEAR_SCREEN, stdout) == EOF) ? -1 : 0;
+}
+
+/**
+ * term_home - Move cursor to (0,0) without clearing the screen.
+ * @return  0 on success, -1 on failure.
+ */
+static inline int term_home(void)
+{
+    return (fputs(TERM_CURSOR_HOME, stdout) == EOF) ? -1 : 0;
+}
+
+/* =========================================================================
  * Dimensions
  * ======================================================================= */
 
@@ -45,7 +77,7 @@ static struct termios _term_saved_attrs;
  * Uses ioctl(TIOCGWINSZ), falling back to the COLUMNS environment variable
  * and finally to 80 if neither is available.
  *
- * @return  Width in columns (>= 1), or -1 on hard failure.
+ * @return  Width in columns (>= 1).
  */
 static inline int term_get_width(void)
 {
@@ -59,7 +91,7 @@ static inline int term_get_width(void)
         if (v > 0) return v;
     }
 
-    return 80; /* sensible default */
+    return 80;
 }
 
 /**
@@ -68,7 +100,7 @@ static inline int term_get_width(void)
  * Uses ioctl(TIOCGWINSZ), falling back to the LINES environment variable
  * and finally to 24 if neither is available.
  *
- * @return  Height in rows (>= 1), or -1 on hard failure.
+ * @return  Height in rows (>= 1).
  */
 static inline int term_get_height(void)
 {
@@ -82,7 +114,7 @@ static inline int term_get_height(void)
         if (v > 0) return v;
     }
 
-    return 24; /* sensible default */
+    return 24;
 }
 
 /* =========================================================================
@@ -95,6 +127,9 @@ static inline int term_get_height(void)
  * Saves the previous terminal attributes so they can be fully restored by
  * term_disable_raw().  Calling this more than once without an intervening
  * term_disable_raw() is safe — subsequent calls are no-ops.
+ *
+ * Note: ISIG is kept enabled so Ctrl-C continues to generate SIGINT.
+ * Handle the signal yourself if you need custom exit behaviour.
  *
  * @return  0 on success, -1 on failure (errno set).
  */
@@ -117,9 +152,9 @@ static inline int term_enable_raw(void)
     /* Control: 8-bit characters. */
     raw.c_cflag |= (tcflag_t)(CS8);
 
-    /* Local: no echo, no canonical mode, no extended processing,
-              no signal generation (Ctrl-C / Ctrl-Z).              */
-    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN | ISIG);
+    /* Local: no echo, no canonical mode, no extended processing.
+              ISIG is intentionally kept so Ctrl-C raises SIGINT. */
+    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN);
 
     /* read() returns as soon as >= 1 byte is available. */
     raw.c_cc[VMIN]  = 1;
@@ -159,6 +194,87 @@ static inline int term_is_raw(void)
 }
 
 /* =========================================================================
+ * Cursor movement
+ * ======================================================================= */
+
+/**
+ * term_move - Move the cursor to a specific (col, row) position.
+ *
+ * Coordinates are 0-based; internally converted to ANSI 1-based values.
+ *
+ * @param col  Column (0-based, left to right).
+ * @param row  Row    (0-based, top to bottom).
+ * @return     0 on success, -1 on failure.
+ */
+static inline int term_move(int col, int row)
+{
+    return (fprintf(stdout, "\033[%d;%dH", row + 1, col + 1) < 0) ? -1 : 0;
+}
+
+/**
+ * term_move_up - Move the cursor up by n rows.
+ * @return  0 on success, -1 on failure.
+ */
+static inline int term_move_up(int n)
+{
+    return (fprintf(stdout, "\033[%dA", n) < 0) ? -1 : 0;
+}
+
+/**
+ * term_move_down - Move the cursor down by n rows.
+ * @return  0 on success, -1 on failure.
+ */
+static inline int term_move_down(int n)
+{
+    return (fprintf(stdout, "\033[%dB", n) < 0) ? -1 : 0;
+}
+
+/**
+ * term_move_right - Move the cursor right by n columns.
+ * @return  0 on success, -1 on failure.
+ */
+static inline int term_move_right(int n)
+{
+    return (fprintf(stdout, "\033[%dC", n) < 0) ? -1 : 0;
+}
+
+/**
+ * term_move_left - Move the cursor left by n columns.
+ * @return  0 on success, -1 on failure.
+ */
+static inline int term_move_left(int n)
+{
+    return (fprintf(stdout, "\033[%dD", n) < 0) ? -1 : 0;
+}
+
+/**
+ * term_get_pos - Query the cursor's current (col, row) position via DSR.
+ *
+ * Sends the ANSI Device Status Report escape (ESC[6n) and reads back
+ * ESC[<row>;<col>R from stdin. Requires raw mode to be active so the
+ * response is not echoed or buffered.
+ *
+ * @param col  Output: current column (0-based).
+ * @param row  Output: current row    (0-based).
+ * @return     0 on success, -1 on failure.
+ */
+static inline int term_get_pos(int *col, int *row)
+{
+    if (!col || !row) { errno = EINVAL; return -1; }
+
+    if (fputs("\033[6n", stdout) == EOF) return -1;
+    fflush(stdout);
+
+    /* Response format: ESC [ <row> ; <col> R */
+    int r = 0, c = 0;
+    if (scanf("\033[%d;%dR", &r, &c) != 2) return -1;
+
+    *row = r - 1;
+    *col = c - 1;
+    return 0;
+}
+
+/* =========================================================================
  * Colour  (24-bit / true-colour ANSI escape sequences)
  * ======================================================================= */
 
@@ -194,8 +310,6 @@ static inline int term_set_bg(uint8_t r, uint8_t g, uint8_t b)
                     (int)r, (int)g, (int)b) < 0) ? -1 : 0;
 }
 
-
-
 /**
  * term_reset_color - Reset foreground and background to terminal defaults.
  *
@@ -205,25 +319,7 @@ static inline int term_set_bg(uint8_t r, uint8_t g, uint8_t b)
  */
 static inline int term_reset_color(void)
 {
-    return (fprintf(stdout, "\033[0m") < 0) ? -1 : 0;
-}
-
-static inline int term_is_key(char c)
-{
-    fd_set fds;
-    struct timeval tv = {0, 0};
-    FD_ZERO(&fds);
-    FD_SET(STDIN_FILENO, &fds);
-
-    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
-        int byte = getchar();
-        if (byte != EOF) {
-            if ((char)byte == c)
-                return 1;
-            ungetc(byte, stdin);  /* put it back if it doesn't match */
-        }
-    }
-    return 0;
+    return (fputs("\033[0m", stdout) == EOF) ? -1 : 0;
 }
 
 /**
@@ -244,15 +340,12 @@ static inline int term_fill_bg(uint8_t r, uint8_t g, uint8_t b)
 
     if (term_set_bg(r, g, b) < 0) return -1;
 
-    for (int row = 0; row < h; row++) {
-        for (int col = 0; col < w; col++) {
+    for (int row = 0; row < h; row++)
+        for (int col = 0; col < w; col++)
             if (fputc(' ', stdout) == EOF) return -1;
-        }
-    }
 
     if (term_reset_color() < 0) return -1;
-    fputs("\033[H", stdout);   /* cursor back to top-left */
-    return 0;
+    return (fputs(TERM_CURSOR_HOME, stdout) == EOF) ? -1 : 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -260,6 +353,7 @@ static inline int term_fill_bg(uint8_t r, uint8_t g, uint8_t b)
  *
  * Usage:  term_set_fg(TERM_RED);
  *         term_set_bg(TERM_BLUE);
+ *         term_fill_bg(TERM_BLACK);
  * ---------------------------------------------------------------------- */
 #define TERM_BLACK     0,   0,   0
 #define TERM_WHITE   255, 255, 255
@@ -269,6 +363,41 @@ static inline int term_fill_bg(uint8_t r, uint8_t g, uint8_t b)
 #define TERM_BLUE     38, 139, 210
 #define TERM_MAGENTA 211,  54, 130
 #define TERM_CYAN      0, 168, 168
+
+/* =========================================================================
+ * Input
+ * ======================================================================= */
+
+/**
+ * term_is_key - Non-blocking check if a specific key was pressed on stdin.
+ *
+ * Uses select() to poll stdin without blocking. If a byte is available but
+ * does not match c, it is pushed back via ungetc() so future reads see it.
+ * Intended to be called once per frame inside a render loop.
+ *
+ * Requires raw mode to be active (term_enable_raw) so bytes are available
+ * immediately without waiting for Enter.
+ *
+ * @param c  The character to check for (e.g. 0x03 for Ctrl+C, 'q' to quit).
+ * @return   1 if the key was pressed, 0 otherwise.
+ */
+static inline int term_is_key(char c)
+{
+    fd_set fds;
+    struct timeval tv = {0, 0};
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+        int byte = getchar();
+        if (byte != EOF) {
+            if ((char)byte == c)
+                return 1;
+            ungetc(byte, stdin);  /* put it back if it doesn't match */
+        }
+    }
+    return 0;
+}
 
 #ifdef __cplusplus
 }
