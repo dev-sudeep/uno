@@ -28,6 +28,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <termios.h>
@@ -309,6 +310,43 @@ static inline int term_set_bg(uint8_t r, uint8_t g, uint8_t b)
     return (fprintf(stdout, "\033[48;2;%d;%d;%dm",
                     (int)r, (int)g, (int)b) < 0) ? -1 : 0;
 }
+
+
+int term_get_bg(int* r, int* g, int* b) {
+    char response[64];
+    int i = 0;
+
+    term_enable_raw();
+
+    // Send the OSC 11 query
+    // \033]11;?\a  (Query background color)
+    write(STDOUT_FILENO, "\033]11;?\a", 7);
+
+    // 3. Read the response from stdin
+    // Response format: \033]11;rgb:rrrr/gggg/bbbb\a
+    // We read until the BEL (\a) or a timeout occurs
+    while (i < sizeof(response) - 1) {
+        if (read(STDIN_FILENO, &response[i], 1) <= 0) break;
+        if (response[i] == '\a' || response[i] == '\\') break; 
+        i++;
+    }
+    response[i] = '\0';
+
+    
+
+    // 5. Parse the RGB values
+    // Looking for "rgb:RRRR/GGGG/BBBB"
+    char* rgb_start = strstr(response, "rgb:");
+    if (rgb_start && sscanf(rgb_start, "rgb:%x/%x/%x", r, g, b) == 3) {
+        // Most terminals return 16-bit values (0-65535)
+        // Scale down to 8-bit (0-255) if needed
+        *r /= 256; *g /= 256; *b /= 256;
+        return 0; // Success
+    }
+
+    return -1; // Failure
+}
+
 
 /**
  * term_reset_color - Reset foreground and background to terminal defaults.

@@ -1,12 +1,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <ctype.h>
 #include <errno.h>
 #include "term.h"
+
+int r=0, g=0, b=0;
+
 
 /* =========================================================================
  * File size
@@ -97,8 +99,6 @@ static inline int file_write(FILE *fp, const char *buf)
 
 #define TERM_CLEAR_SCREEN  "\033[2J\033[H"
 #define TERM_CURSOR_HOME   "\033[H"
-#define FPS       180
-#define FRAME_US  (1000000 / FPS)
 
 static volatile int running = 1;
 
@@ -109,12 +109,13 @@ void handle_sigint(int sig) {
 
 void cleanup(void) {
     term_disable_raw();
-    fputs("\033[?25h", stdout);  /* restore cursor */
+    term_set_bg(r, g, b);
+    fputs("\033[?25h" TERM_CLEAR_SCREEN, stdout);  /* restore cursor and clear screen*/
     fflush(stdout);
 }
 
 void clear(void) {
-    fputs(TERM_CLEAR_SCREEN, stdout);
+    fputs(TERM_CURSOR_HOME, stdout);
     fflush(stdout);
 }
 
@@ -133,6 +134,7 @@ int countDigits(int n) {
 
 void showstr(char* str){
     int count = 1;
+
     for (int i = 0; str[i] != '\0'; i++) {
         if (str[i] == '\n') {
             count++;
@@ -204,10 +206,14 @@ int main(int argc, char *argv[]) {
 
     atexit(cleanup);
     signal(SIGINT, handle_sigint);
+    if(-term_get_bg(&r, &b, &g)){
+        fprintf(stderr, "Failed to get terminal background color\n");
+        term_enable_raw();
+        printf("press any key to continue. Note that on exit terminal background color will automatically be set to black.");
+        getc(stdin);
+    }
     term_enable_raw();
     fputs("\033[?25l", stdout);  /* hide cursor */
-
-    struct timespec t0, t1;
 
     char heading[4096];
     snprintf(heading, sizeof(heading), "Editing %s", argv[1]);
@@ -215,8 +221,6 @@ int main(int argc, char *argv[]) {
 
 
     while (running) {
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-
         clear();
 
         int w = term_get_width();
@@ -282,13 +286,7 @@ int main(int argc, char *argv[]) {
         	file_write(fp, s);
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        long elapsed_us = (t1.tv_sec  - t0.tv_sec)  * 1000000L
-                        + (t1.tv_nsec - t0.tv_nsec) / 1000L;
-        long remaining  = FRAME_US - elapsed_us;
-
-        if (remaining > 0)
-            usleep((useconds_t)remaining);
+        
     }
     if(isfile) fclose(fp);
     return 0;
