@@ -100,18 +100,6 @@ static inline int file_write(FILE *fp, const char *buf)
 #define TERM_CLEAR_SCREEN  "\033[2J\033[H"
 #define TERM_CURSOR_HOME   "\033[H"
 
-#define ENSURE_CAP(s, sc, n)                                        \
-    __extension__({                                                  \
-        int _fail = 0;                                               \
-        while (strlen(s) + (size_t)(n) + 1 >= (size_t)(sc)) {       \
-            (sc) *= 2;                                               \
-            char *_tmp = realloc((s), (sc));                         \
-            if (!_tmp) { perror("realloc"); _fail = 1; break; }      \
-            (s) = _tmp;                                              \
-        }                                                            \
-        _fail;                                                       \
-    })
-
 static volatile int running = 1;
 
 void handle_sigint(int sig) {
@@ -296,59 +284,25 @@ int main(int argc, char *argv[]) {
         		fp = fopen(argv[1], "w+");
         	}
         	file_write(fp, s);
-        }
-        else if (a == '\x1b') {
-            /* Read enough to check for bracketed paste start: [ 2 0 0 ~ */
-            char seq[5];
-            for (int i = 0; i < 5; i++)
-                seq[i] = getc(stdin);
-        
-            if (seq[0]=='[' && seq[1]=='2' && seq[2]=='0' && seq[3]=='0' && seq[4]=='~') {
-                /* Bracketed paste: read until ESC [ 2 0 1 ~ */
-                int prev1 = 0, prev2 = 0, prev3 = 0, prev4 = 0;
-                int c;
-                while ((c = getc(stdin)) != EOF) {
-                    /* Detect end sequence \033[201~ */
-                    if (prev4=='\x1b' && prev3=='[' && prev2=='2' && prev1=='0' && c=='1') {
-                        /* consume the trailing ~ */
-                        getc(stdin);
-                        break;
-                    }
-                    /* Flush the oldest byte into the buffer if it wasn't part of end seq */
-                    if (prev4 != 0) {
-                        if (ENSURE_CAP(s, sc, 2)) return 1;
-                        size_t len = strlen(s);
-                        /* Normalise CR and CR+LF to LF */
-                        if (prev4 == '\r') {
-                            if (prev3 != '\n') { s[len] = '\n'; s[len+1] = '\0'; }
-                        } else {
-                            s[len] = (char)prev4; s[len+1] = '\0';
-                        }
-                    }
-                    prev4 = prev3; prev3 = prev2; prev2 = prev1; prev1 = c;
-                }
-                /* Flush remaining bytes that weren't part of the end sequence */
-                int tail[4] = { prev4, prev3, prev2, prev1 };
-                for (int i = 0; i < 4; i++) {
-                    if (tail[i] == 0) continue;
-                    if (ENSURE_CAP(s, sc, 2)) return 1;
-                    size_t len = strlen(s);
-                    if (tail[i] == '\r') {
-                        if (i+1 < 4 && tail[i+1] != '\n') { s[len] = '\n'; s[len+1] = '\0'; }
-                    } else {
-                        s[len] = (char)tail[i]; s[len+1] = '\0';
-                    }
-                }
-            } else {
-                /* Not a bracketed paste — just drain whatever else is buffered */
-                struct timeval tv = {0, 10000};
-                fd_set fds;
-                FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
-                while (select(STDIN_FILENO+1, &fds, NULL, NULL, &tv) > 0) {
-                    getc(stdin);
-                    FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
-                    tv.tv_usec = 1000;
-                }
+        }else if(a == '\x1b'){
+            if(getc(stdin) == '[' && getc(stdin) == '2' && getc(stdin) == '0'){
+            	ispaste = getc(stdin) - '0';
+            	if(getc(stdin) != '~'){
+            		ispaste = 0;
+            	}
+            }
+            if(ispaste){
+                char c;
+            	while((c = getc(stdin)) != '\x1b'){
+            		char* b = malloc(2);
+            		sprintf(b, "%c", c);
+            		strcat(s, b);
+            	}
+            	int i = 0;
+            	while(i < 5){
+            		getc(stdin);
+            		i++;
+            	}
             }
         }
 
