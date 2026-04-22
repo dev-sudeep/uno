@@ -28,7 +28,6 @@ extern "C" {
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <termios.h>
@@ -163,8 +162,6 @@ static inline int term_enable_raw(void)
 
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0) return -1;
 
-    write(STDOUT_FILENO, "\x1b[?2004h", 8); // enable bracketed paste
-    
     _term_raw_active = 1;
     return 0;
 }
@@ -182,7 +179,6 @@ static inline int term_disable_raw(void)
 
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &_term_saved_attrs) < 0) return -1;
 
-    write(STDOUT_FILENO, "\x1b[?2004l", 8); // disable
     _term_raw_active = 0;
     return 0;
 }
@@ -314,43 +310,6 @@ static inline int term_set_bg(uint8_t r, uint8_t g, uint8_t b)
                     (int)r, (int)g, (int)b) < 0) ? -1 : 0;
 }
 
-
-int term_get_bg(int* r, int* g, int* b) {
-    char response[64];
-    int i = 0;
-
-    term_enable_raw();
-
-    // Send the OSC 11 query
-    // \033]11;?\a  (Query background color)
-    write(STDOUT_FILENO, "\033]11;?\a", 7);
-
-    // 3. Read the response from stdin
-    // Response format: \033]11;rgb:rrrr/gggg/bbbb\a
-    // We read until the BEL (\a) or a timeout occurs
-    while (i < sizeof(response) - 1) {
-        if (read(STDIN_FILENO, &response[i], 1) <= 0) break;
-        if (response[i] == '\a' || response[i] == '\\') break; 
-        i++;
-    }
-    response[i] = '\0';
-
-    
-
-    // 5. Parse the RGB values
-    // Looking for "rgb:RRRR/GGGG/BBBB"
-    char* rgb_start = strstr(response, "rgb:");
-    if (rgb_start && sscanf(rgb_start, "rgb:%x/%x/%x", r, g, b) == 3) {
-        // Most terminals return 16-bit values (0-65535)
-        // Scale down to 8-bit (0-255) if needed
-        *r /= 256; *g /= 256; *b /= 256;
-        return 0; // Success
-    }
-
-    return -1; // Failure
-}
-
-
 /**
  * term_reset_color - Reset foreground and background to terminal defaults.
  *
@@ -361,6 +320,62 @@ int term_get_bg(int* r, int* g, int* b) {
 static inline int term_reset_color(void)
 {
     return (fputs("\033[0m", stdout) == EOF) ? -1 : 0;
+}
+
+/**
+ * term_get_bg - Query the terminal's default background colour via OSC 11.
+ *
+ * Sends the OSC 11 escape sequence and reads back the terminal's response.
+ * This returns the terminal emulator's theme background colour, NOT the
+ * colour last set by term_set_bg(). Requires raw mode to be active so the
+ * response can be read without waiting for Enter.
+ *
+ * The response arrives as:
+ *   ESC ] 11 ; rgb: rrrr / gggg / bbbb ESC backslash
+ * Each channel is 16-bit (0000-ffff); we scale to 8-bit [0-255].
+ *
+ * @param r  Output: red channel   [0-255].
+ * @param g  Output: green channel [0-255].
+ * @param b  Output: blue channel  [0-255].
+ * @return   0 on success, -1 on failure.
+ */
+static inline int term_get_bg(int *r, int *g, int *b)
+{
+    if (!r || !g || !b) { errno = EINVAL; return -1; }
+
+    /* Send OSC 11 query — ST terminated with ESC \ */
+    if (fputs("\033]11;?\033\\", stdout) == EOF) return -1;
+    fflush(stdout);
+
+    /* Read response into buffer until ST (ESC \) or BEL terminator */
+    char buf[64];
+    int  i = 0;
+    int  ch;
+    while (i < (int)(sizeof(buf) - 1)) {
+        ch = getchar();
+        if (ch == EOF) return -1;
+        buf[i++] = (char)ch;
+
+        /* ST terminator: ESC \ */
+        if (i >= 2 && buf[i-2] == '\033' && buf[i-1] == '\\') break;
+        /* BEL terminator (some terminals use \a instead) */
+        if (buf[i-1] == '\a') break;
+    }
+    buf[i] = '\0';
+
+    /* Expected format: ESC ] 11 ; rgb: RRRR / GGGG / BBBB <ST>
+     * The leading ESC ] arrives as two chars \033 and ] so we
+     * scan for the "rgb:" marker directly.                        */
+    unsigned int rv = 0, gv = 0, bv = 0;
+    char *p = buf;
+    while (*p && *p != 'r') p++;   /* skip to "rgb:" */
+    if (sscanf(p, "rgb:%4x/%4x/%4x", &rv, &gv, &bv) != 3) return -1;
+
+    /* Scale from 16-bit (0x0000-0xffff) down to 8-bit (0-255) */
+    *r = (int)(rv >> 8);
+    *g = (int)(gv >> 8);
+    *b = (int)(bv >> 8);
+    return 0;
 }
 
 /**
@@ -437,6 +452,124 @@ static inline int term_is_key(char c)
             ungetc(byte, stdin);  /* put it back if it doesn't match */
         }
     }
+    return 0;
+}
+
+/* =========================================================================
+ * Mouse events
+ * ======================================================================= */
+
+/* Enable/disable SGR extended mouse reporting (supports coordinates > 223).
+ * Call term_mouse_enable() after term_enable_raw() at startup, and
+ * term_mouse_disable() before term_disable_raw() at exit.               */
+#define TERM_MOUSE_ENABLE   "\033[?1000h\033[?1006h"  /* enable button + SGR mode */
+#define TERM_MOUSE_DISABLE  "\033[?1006l\033[?1000l"  /* disable SGR mode + button */
+
+/** Mouse button identifiers returned in TermMouseEvent.button. */
+#define TERM_MOUSE_LEFT      0
+#define TERM_MOUSE_MIDDLE    1
+#define TERM_MOUSE_RIGHT     2
+#define TERM_MOUSE_RELEASE   3
+#define TERM_MOUSE_SCROLL_UP 64
+#define TERM_MOUSE_SCROLL_DOWN 65
+
+/** Mouse event — filled by term_mouse_event(). */
+typedef struct {
+    int button;   /**< TERM_MOUSE_* constant.          */
+    int col;      /**< 0-based column of the event.    */
+    int row;      /**< 0-based row of the event.       */
+    int pressed;  /**< 1 = press/scroll, 0 = release.  */
+} TermMouseEvent;
+
+/**
+ * term_mouse_enable - Enable mouse event reporting.
+ *
+ * Writes TERM_MOUSE_ENABLE to stdout. Call once after term_enable_raw().
+ * @return  0 on success, -1 on failure.
+ */
+static inline int term_mouse_enable(void)
+{
+    return (fputs(TERM_MOUSE_ENABLE, stdout) == EOF) ? -1 : 0;
+}
+
+/**
+ * term_mouse_disable - Disable mouse event reporting.
+ *
+ * Writes TERM_MOUSE_DISABLE to stdout. Call once before term_disable_raw().
+ * @return  0 on success, -1 on failure.
+ */
+static inline int term_mouse_disable(void)
+{
+    return (fputs(TERM_MOUSE_DISABLE, stdout) == EOF) ? -1 : 0;
+}
+
+/**
+ * term_mouse_event - Non-blocking read of a single SGR mouse event.
+ *
+ * Polls stdin with select(). If an SGR mouse escape sequence is available
+ * (ESC [ < btn ; col ; row M/m) it is parsed into *ev and 0 is returned.
+ * If no mouse event is pending the bytes are put back and -1 is returned.
+ *
+ * Requires raw mode and mouse reporting to be enabled via term_mouse_enable().
+ *
+ * @param ev  Output: populated with button, col, row and pressed state.
+ * @return    0 on success (event available), -1 if no event.
+ */
+static inline int term_mouse_event(TermMouseEvent *ev)
+{
+    if (!ev) return -1;
+
+    /* Non-blocking poll */
+    fd_set fds;
+    struct timeval tv = {0, 0};
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) <= 0) return -1;
+
+    /* Peek at the first byte — must be ESC */
+    int b0 = getchar();
+    if (b0 == EOF || (char)b0 != '\033') {
+        if (b0 != EOF) ungetc(b0, stdin);
+        return -1;
+    }
+
+    /* Must be followed immediately by '[' */
+    int b1 = getchar();
+    if (b1 == EOF || (char)b1 != '[') {
+        if (b1 != EOF) ungetc(b1, stdin);
+        ungetc(b0, stdin);
+        return -1;
+    }
+
+    /* Must be followed by '<' (SGR marker) */
+    int b2 = getchar();
+    if (b2 == EOF || (char)b2 != '<') {
+        if (b2 != EOF) ungetc(b2, stdin);
+        ungetc(b1, stdin);
+        ungetc(b0, stdin);
+        return -1;
+    }
+
+    /* Read the rest of the sequence: btn;col;rowM or btn;col;rowm */
+    char buf[32];
+    int  i = 0;
+    int  ch;
+    while (i < (int)(sizeof(buf) - 1)) {
+        ch = getchar();
+        if (ch == EOF) return -1;
+        buf[i++] = (char)ch;
+        if ((char)ch == 'M' || (char)ch == 'm') break;
+    }
+    buf[i] = '\0';
+
+    int btn, col, row;
+    char final;
+    if (sscanf(buf, "%d;%d;%d%c", &btn, &col, &row, &final) != 4) return -1;
+
+    ev->button  = btn;
+    ev->col     = col - 1;   /* convert to 0-based */
+    ev->row     = row - 1;
+    ev->pressed = (final == 'M') ? 1 : 0;
     return 0;
 }
 

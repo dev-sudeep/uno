@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <ctype.h>
 #include <errno.h>
+#include <sys/select.h>
 #include "term.h"
 
 int r=0, g=0, b=0;
@@ -122,7 +123,7 @@ void handle_sigint(int sig) {
 void cleanup(void) {
     term_disable_raw();
     term_set_bg(r, g, b);
-    fputs("\033[?25h" TERM_CLEAR_SCREEN, stdout);  /* restore cursor and clear screen*/
+    fputs("\033[?25h" TERM_CLEAR_SCREEN, stdout);  /* restore cursor and clear screen */
     fflush(stdout);
 }
 
@@ -132,66 +133,60 @@ void clear(void) {
 }
 
 int countDigits(int n) {
-    if (n == 0) return 1; // Special case for 0
+    if (n == 0) return 1;
     int count = 0;
-    if (n < 0) n = -n;    // Handle negative numbers
-    
-    while (n != 0) {
-        n /= 10;
-        count++;
-    }
+    if (n < 0) n = -n;
+    while (n != 0) { n /= 10; count++; }
     return count;
 }
 
-
-void showstr(char* str){
+void showstr(char* str) {
     int count = 1;
-
     for (int i = 0; str[i] != '\0'; i++) {
-        if (str[i] == '\n') {
-            count++;
-        }
+        if (str[i] == '\n') count++;
     }
 
-    int i = 0;
     term_move(0, 1);
     term_set_bg(64, 64, 64);
     term_set_fg(229, 229, 229);
     int d = countDigits(count) + 1;
     int x = d, y = 1;
-    printf("%d%*c", y, d-y, ' ');
-	term_move(x, y);
-	term_set_fg(TERM_WHITE);
-	for(i = 0; i < strlen(str); i++){
-	    term_set_bg(100, 100, 100);
-	    term_set_fg(TERM_WHITE);
-	    term_move(x, y);
-		if(isprint(str[i])){
-			putc(str[i], stdout);
-			x++;
-			term_move(x, y);
-		}else if(str[i] == '\n' || str[i] == '\r'){
-			x = d;
-			y++;
-			if((str[i] == '\n' && str[i+1] == '\r') || (str[i] == '\r' && str[i+1] == '\n')){
-				i++;
-			}
-			term_move(0, y);
-			term_set_bg(64, 64, 64);
-			term_set_fg(229, 229, 229);
-			printf("%d%*c", y, d-countDigits(y), ' ');
-			term_move(x, y);
-		}
-	}
-	int w = x;
-	int l = y;
-    for( ;y < term_get_height(); y++){
-    	term_move(0, y+1);
-    	term_set_bg(64, 64, 64);
-    	term_set_fg(229, 229, 229);
-    	printf("%*c", d, ' ');
+    printf("%d%*c", y, d - y, ' ');
+    term_move(x, y);
+    term_set_fg(TERM_WHITE);
+
+    for (int i = 0; str[i] != '\0'; i++) {
+        term_set_bg(100, 100, 100);
+        term_set_fg(TERM_WHITE);
+        term_move(x, y);
+        if (isprint(str[i])) {
+            putc(str[i], stdout);
+            x++;
+            term_move(x, y);
+        } else if (str[i] == '\n' || str[i] == '\r') {
+            x = d;
+            y++;
+            if ((str[i] == '\n' && str[i+1] == '\r') ||
+                (str[i] == '\r' && str[i+1] == '\n')) {
+                i++;
+            }
+            term_move(0, y);
+            term_set_bg(64, 64, 64);
+            term_set_fg(229, 229, 229);
+            printf("%d%*c", y, d - countDigits(y), ' ');
+            term_move(x, y);
+        }
     }
-    term_move(w, l); 
+
+    int w = x;
+    int l = y;
+    for (; y < term_get_height(); y++) {
+        term_move(0, y + 1);
+        term_set_bg(64, 64, 64);
+        term_set_fg(229, 229, 229);
+        printf("%*c", d, ' ');
+    }
+    term_move(w, l);
 }
 
 int main(int argc, char *argv[]) {
@@ -202,35 +197,36 @@ int main(int argc, char *argv[]) {
 
     FILE *fp = fopen(argv[1], "r+");
     char* s;
-    int sc, isfile, ispaste;
+    int sc, isfile;
     if (!fp) {
-        s = (char*)malloc(3);
-        sprintf(s, "");
-        sc = 6;
-        isfile=0;
-    }else{
-    	s = (char*)malloc(file_size(fp) + 1);
-    	file_read(fp, s);
-        sc = (file_size(fp) + 1) * 2;
-        isfile=1;
-
+        sc = 16;
+        s  = (char*)malloc(sc);
+        if (!s) { perror("malloc"); return 1; }
+        s[0] = '\0';
+        isfile = 0;
+    } else {
+        int sz = file_size(fp);
+        if (sz < 0) { perror("file_size"); fclose(fp); return 1; }
+        sc = sz + 16;
+        s  = (char*)malloc(sc);
+        if (!s) { perror("malloc"); fclose(fp); return 1; }
+        file_read(fp, s);
+        isfile = 1;
     }
 
     atexit(cleanup);
     signal(SIGINT, handle_sigint);
-    if(-term_get_bg(&r, &b, &g)){
+    term_enable_raw();
+    if (-term_get_bg(&r, &b, &g)) {
         fprintf(stderr, "Failed to get terminal background color\n");
         term_enable_raw();
         printf("press any key to continue. Note that on exit terminal background color will automatically be set to black.");
         getc(stdin);
     }
-    term_enable_raw();
     fputs("\033[?25l", stdout);  /* hide cursor */
 
     char heading[4096];
     snprintf(heading, sizeof(heading), "Editing %s", argv[1]);
-
-
 
     while (running) {
         clear();
@@ -259,88 +255,80 @@ int main(int argc, char *argv[]) {
 
         int a = getc(stdin);
 
-        if(strlen(s) + 2 >= sc){
-            sc *= 2;
-        	char* temp = realloc(s, sc);
-        	if(!temp){
-        		perror("Unable to allocate memory");
-        		return 1;
-        	}
-        	s = temp;
-        }
-
         if (a == 127 || a == '\b') {  /* Backspace */
             size_t len = strlen(s);
-            if (len > 0) {
-                s[len - 1] = '\0';
-            }
+            if (len > 0) s[len - 1] = '\0';
         }
         else if (a == '\r' || a == '\n') {  /* Enter */
+            if (ENSURE_CAP(s, sc, 2)) return 1;
             size_t len = strlen(s);
-            if (len < sc - 1) {
-                s[len] = '\n';
-                s[len + 1] = '\0';
-            }
+            s[len] = '\n'; s[len + 1] = '\0';
         }
         else if (isprint(a)) {  /* Normal characters */
+            if (ENSURE_CAP(s, sc, 2)) return 1;
             size_t len = strlen(s);
-            if (len < sc - 1) {
-                s[len] = (char)a;
-                s[len + 1] = '\0';
-            }
+            s[len] = (char)a; s[len + 1] = '\0';
         }
         else if (a == 17) {  /* Ctrl+Q */
             running = 0;
-        }else if(a == 19){
-        	if(!isfile){
-        		fp = fopen(argv[1], "w+");
-        	}
-        	file_write(fp, s);
+        }
+        else if (a == 19) {  /* Ctrl+S */
+            if (!isfile) {
+                fp = fopen(argv[1], "w+");
+                isfile = 1;
+            }
+            file_write(fp, s);
         }
         else if (a == '\x1b') {
-            /* Read enough to check for bracketed paste start: [ 2 0 0 ~ */
+            /* Read 5 bytes to check for bracketed paste start: \033[200~ */
             char seq[5];
             for (int i = 0; i < 5; i++)
                 seq[i] = getc(stdin);
-        
+
             if (seq[0]=='[' && seq[1]=='2' && seq[2]=='0' && seq[3]=='0' && seq[4]=='~') {
-                /* Bracketed paste: read until ESC [ 2 0 1 ~ */
-                int prev1 = 0, prev2 = 0, prev3 = 0, prev4 = 0;
+                /*
+                 * Bracketed paste — read until end sequence \033[201~
+                 *
+                 * Use a 5-byte sliding window so the entire end sequence
+                 * fits in the window before any of it gets flushed to the
+                 * buffer. p[0] is always the oldest (next-to-flush) byte.
+                 */
+                int p[5] = {0, 0, 0, 0, 0};
                 int c;
                 while ((c = getc(stdin)) != EOF) {
-                    /* Detect end sequence \033[201~ */
-                    if (prev4=='\x1b' && prev3=='[' && prev2=='2' && prev1=='0' && c=='1') {
-                        /* consume the trailing ~ */
-                        getc(stdin);
+                    /* End sequence: window holds \033[201 and current byte is ~ */
+                    if (p[0]=='\x1b' && p[1]=='[' && p[2]=='2' && p[3]=='0' && p[4]=='1' && c=='~')
                         break;
-                    }
-                    /* Flush the oldest byte into the buffer if it wasn't part of end seq */
-                    if (prev4 != 0) {
+
+                    /* p[0] is safe to flush — can't be start of end sequence */
+                    if (p[0] != 0) {
                         if (ENSURE_CAP(s, sc, 2)) return 1;
                         size_t len = strlen(s);
-                        /* Normalise CR and CR+LF to LF */
-                        if (prev4 == '\r') {
-                            if (prev3 != '\n') { s[len] = '\n'; s[len+1] = '\0'; }
+                        if (p[0] == '\r') {
+                            /* Normalise CR / CR+LF to LF */
+                            if (p[1] != '\n') { s[len] = '\n'; s[len+1] = '\0'; }
                         } else {
-                            s[len] = (char)prev4; s[len+1] = '\0';
+                            s[len] = (char)p[0]; s[len+1] = '\0';
                         }
                     }
-                    prev4 = prev3; prev3 = prev2; prev2 = prev1; prev1 = c;
+
+                    /* Shift window */
+                    p[0]=p[1]; p[1]=p[2]; p[2]=p[3]; p[3]=p[4]; p[4]=c;
                 }
-                /* Flush remaining bytes that weren't part of the end sequence */
-                int tail[4] = { prev4, prev3, prev2, prev1 };
-                for (int i = 0; i < 4; i++) {
-                    if (tail[i] == 0) continue;
+
+                /* Flush remaining window bytes — none are part of end sequence */
+                for (int i = 0; i < 5; i++) {
+                    if (p[i] == 0) continue;
                     if (ENSURE_CAP(s, sc, 2)) return 1;
                     size_t len = strlen(s);
-                    if (tail[i] == '\r') {
-                        if (i+1 < 4 && tail[i+1] != '\n') { s[len] = '\n'; s[len+1] = '\0'; }
+                    if (p[i] == '\r') {
+                        if (i+1 < 5 && p[i+1] != '\n') { s[len] = '\n'; s[len+1] = '\0'; }
                     } else {
-                        s[len] = (char)tail[i]; s[len+1] = '\0';
+                        s[len] = (char)p[i]; s[len+1] = '\0';
                     }
                 }
             } else {
-                /* Not a bracketed paste — just drain whatever else is buffered */
+                /* Not a bracketed paste — drain remaining buffered bytes */
                 struct timeval tv = {0, 10000};
                 fd_set fds;
                 FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
@@ -352,8 +340,10 @@ int main(int argc, char *argv[]) {
             }
         }
 
-       fflush(stdout); 
+        fflush(stdout);
     }
-    if(isfile) fclose(fp);
+
+    free(s);
+    if (isfile) fclose(fp);
     return 0;
 }
