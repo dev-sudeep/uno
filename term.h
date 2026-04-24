@@ -462,8 +462,8 @@ static inline int term_is_key(char c)
 /* Enable/disable SGR extended mouse reporting (supports coordinates > 223).
  * Call term_mouse_enable() after term_enable_raw() at startup, and
  * term_mouse_disable() before term_disable_raw() at exit.               */
-#define TERM_MOUSE_ENABLE   "\033[?1000h\033[?1006h"  /* enable button + SGR mode */
-#define TERM_MOUSE_DISABLE  "\033[?1006l\033[?1000l"  /* disable SGR mode + button */
+#define TERM_MOUSE_ENABLE   "\033[?1000h\033[?1002h\033[?1006h"  /* button, drag + SGR */
+#define TERM_MOUSE_DISABLE  "\033[?1006l\033[?1002l\033[?1000l"  /* disable SGR + drag */
 
 /** Mouse button identifiers returned in TermMouseEvent.button. */
 #define TERM_MOUSE_LEFT      0
